@@ -36,6 +36,7 @@ import (
 	"strings"
 
 	"github.com/apache/arrow/go/v13/arrow/flight"
+	"github.com/apache/arrow/go/v13/arrow/flight/flightsql"
 )
 
 // Client implements an InfluxDB client.
@@ -48,6 +49,8 @@ type Client struct {
 	apiURL *url.URL
 	// Flight client for executing queries
 	queryClient *flight.Client
+	// Flight client for executing queries
+	queryClientSql *flightsql.Client
 }
 
 // httpParams holds parameters for creating an HTTP request

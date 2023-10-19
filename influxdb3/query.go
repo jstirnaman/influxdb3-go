@@ -25,11 +25,15 @@ package influxdb3
 import (
 	"context"
 	"crypto/x509"
-	"encoding/json"
+
+	// "encoding/json"
 	"fmt"
 	"strings"
 
+	"github.com/apache/arrow/go/v13/arrow"
+	"github.com/apache/arrow/go/v13/arrow/array"
 	"github.com/apache/arrow/go/v13/arrow/flight"
+	"github.com/apache/arrow/go/v13/arrow/flight/flightsql"
 	"github.com/apache/arrow/go/v13/arrow/ipc"
 	"github.com/apache/arrow/go/v13/arrow/memory"
 	"google.golang.org/grpc"
@@ -62,6 +66,12 @@ func (c *Client) initializeQueryClient() error {
 		return fmt.Errorf("flight: %s", err)
 	}
 	c.queryClient = &client
+	clientFlight, err := flightsql.NewClient(url, nil, nil, opts...);
+	if err != nil {
+		return fmt.Errorf("flight: %s", err)
+	}
+	c.queryClientSql = clientFlight;
+
 
 	return nil
 }
@@ -74,8 +84,8 @@ func (c *Client) initializeQueryClient() error {
 // Returns:
 //   - A custom iterator (*QueryIterator).
 //   - An error, if any.
-func (c *Client) Query(ctx context.Context, query string) (*QueryIterator, error) {
-	return c.QueryWithOptions(ctx, &DefaultQueryOptions, query)
+func (c *Client) Query(ctx context.Context, query string, params... map[string]interface{}) (*QueryIterator, error) {
+	return c.QueryWithOptions(ctx, &DefaultQueryOptions, query, params...)
 }
 
 // Query data from InfluxDB IOx with query options.
@@ -87,13 +97,13 @@ func (c *Client) Query(ctx context.Context, query string) (*QueryIterator, error
 // Returns:
 //   - A custom iterator (*QueryIterator) that can also be used to get raw flightsql reader.
 //   - An error, if any.
-func (c *Client) QueryWithOptions(ctx context.Context, options *QueryOptions, query string) (*QueryIterator, error) {
+func (c *Client) QueryWithOptions(ctx context.Context, options *QueryOptions, query string, params... map[string]interface{}) (*QueryIterator, error) {
 	if options == nil {
 		return nil, fmt.Errorf("options not set")
 	}
 
 	var database string
-	var queryType QueryType
+	// var queryType QueryType
 	if options.Database != "" {
 		database = options.Database
 	} else {
@@ -102,28 +112,64 @@ func (c *Client) QueryWithOptions(ctx context.Context, options *QueryOptions, qu
 	if database == "" {
 		return nil, fmt.Errorf("database not specified")
 	}
-	queryType = options.QueryType
+	// queryType = options.QueryType
 
 	ctx = metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+c.config.Token)
 	ctx = metadata.AppendToOutgoingContext(ctx, "database", database)
 
-	ticketData := map[string]interface{}{
-		"database":   database,
-		"sql_query":  query,
-		"query_type": strings.ToLower(queryType.String()),
-	}
+	// ticketData := map[string]interface{}{
+	// 	"database":   database,
+	// 	"sql_query":  query,
+	// 	"query_type": strings.ToLower(queryType.String()),
+	// }
 
-	ticketJson, err := json.Marshal(ticketData)
+	// ticketJson, err := json.Marshal(ticketData)
+	// if err != nil {
+	// 	return nil, fmt.Errorf("serialize: %s", err)
+	// }
+
+	stmt, err := c.queryClientSql.Prepare(ctx, query)
 	if err != nil {
-		return nil, fmt.Errorf("serialize: %s", err)
+		return nil, fmt.Errorf("flight prepare: %s", err)
 	}
+	defer stmt.Close(ctx)
+	mem := memory.NewCheckedAllocator(memory.DefaultAllocator)
 
-	ticket := &flight.Ticket{Ticket: ticketJson}
-	stream, err := (*c.queryClient).DoGet(ctx, ticket)
+	typeIDs, _, _ := array.FromJSON(mem, arrow.PrimitiveTypes.Int8, strings.NewReader("[0]"))
+	offsets, _, _ := array.FromJSON(mem, arrow.PrimitiveTypes.Int32, strings.NewReader("[0]"))
+	strArray, _, _ := array.FromJSON(mem, arrow.BinaryTypes.String, strings.NewReader(`["%one"]`))
+	bytesArr, _, _ := array.FromJSON(mem, arrow.BinaryTypes.Binary, strings.NewReader("[]"))
+	bigintArr, _, _ := array.FromJSON(mem, arrow.PrimitiveTypes.Int64, strings.NewReader("[]"))
+	dblArr, _, _ := array.FromJSON(mem, arrow.PrimitiveTypes.Float64, strings.NewReader("[]"))
+	paramArr, _ := array.NewDenseUnionFromArraysWithFields(typeIDs,
+		offsets, []arrow.Array{strArray, bytesArr, bigintArr, dblArr},
+		[]string{"string", "bytes", "bigint", "double"})
+	batch := array.NewRecord(arrow.NewSchema([]arrow.Field{
+		{Name: "parameter_1", Type: paramArr.DataType()}}, nil),
+		[]arrow.Array{paramArr}, 1)
+		defer func() {
+			typeIDs.Release()
+			offsets.Release()
+			strArray.Release()
+			bytesArr.Release()
+			bigintArr.Release()
+			dblArr.Release()
+			paramArr.Release()
+			batch.Release()
+		}();
+	stmt.SetParameters(batch);
+	info, err := stmt.Execute(ctx);
 	if err != nil {
-		return nil, fmt.Errorf("flight do get: %s", err)
+		return nil, fmt.Errorf("flight prepare: %s", err)
 	}
 
+	tick := info.Endpoint[0].Ticket.String();
+	print(tick);
+
+	stream, err := (*c.queryClient).DoGet(ctx, info.Endpoint[0].Ticket)
+	if err != nil {
+		return nil, fmt.Errorf("flight doget: %s", err)
+	}
 	reader, err := flight.NewRecordReader(stream, ipc.WithAllocator(memory.DefaultAllocator))
 	if err != nil {
 		return nil, fmt.Errorf("flight reader: %s", err)
