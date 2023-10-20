@@ -4,9 +4,13 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/InfluxCommunity/influxdb3-go/influxdb3"
+	"github.com/apache/arrow/go/v13/arrow"
+	"github.com/apache/arrow/go/v13/arrow/array"
+	"github.com/apache/arrow/go/v13/arrow/memory"
 )
 
 func main() {
@@ -81,10 +85,29 @@ func main() {
     WHERE
     time >= now() - interval '5 minute'
     AND
-    "unit" IN ('temperature')
+    "unit" IN (?1)
   `
 
-	iterator, err := client.Query(context.Background(), query)
+	mem := memory.NewCheckedAllocator(memory.DefaultAllocator)
+
+	typeIDs, _, _ := array.FromJSON(mem, arrow.PrimitiveTypes.Int8, strings.NewReader("[0]"))
+	defer typeIDs.Release()
+	offsets, _, _ := array.FromJSON(mem, arrow.PrimitiveTypes.Int32, strings.NewReader("[0]"))
+	defer offsets.Release()
+
+	strArray, _, _ := array.FromJSON(mem, arrow.BinaryTypes.String, strings.NewReader(`["temperature"]`))
+	defer strArray.Release()
+
+	paramArr, _ := array.NewDenseUnionFromArraysWithFields(typeIDs,
+		offsets, []arrow.Array{strArray},
+		[]string{"unit"})
+	defer paramArr.Release()
+	params := array.NewRecord(arrow.NewSchema([]arrow.Field{
+		{Name: "parameter_1", Type: paramArr.DataType()},
+	}, nil), []arrow.Array{paramArr}, 1)
+	defer params.Release()
+
+	iterator, err := client.QueryParametrized(context.Background(), query, params)
 
 	if err != nil {
 		panic(err)

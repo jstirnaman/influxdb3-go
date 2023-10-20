@@ -28,10 +28,8 @@ import (
 
 	// "encoding/json"
 	"fmt"
-	"strings"
 
 	"github.com/apache/arrow/go/v13/arrow"
-	"github.com/apache/arrow/go/v13/arrow/array"
 	"github.com/apache/arrow/go/v13/arrow/flight"
 	"github.com/apache/arrow/go/v13/arrow/flight/flightsql"
 	"github.com/apache/arrow/go/v13/arrow/ipc"
@@ -84,8 +82,21 @@ func (c *Client) initializeQueryClient() error {
 // Returns:
 //   - A custom iterator (*QueryIterator).
 //   - An error, if any.
-func (c *Client) Query(ctx context.Context, query string, params... map[string]interface{}) (*QueryIterator, error) {
-	return c.QueryWithOptions(ctx, &DefaultQueryOptions, query, params...)
+func (c *Client) Query(ctx context.Context, query string) (*QueryIterator, error) {
+	return c.QueryWithOptions(ctx, &DefaultQueryOptions, query, nil)
+}
+
+// Query data from InfluxDB IOx with FlightSQL.
+// Parameters:
+//   - ctx: The context.Context to use for the request.
+//   - query: The InfluxQL query string to execute.
+//	 - params: The params to be placed inside query.
+//
+// Returns:
+//   - A custom iterator (*QueryIterator).
+//   - An error, if any.
+func (c *Client) QueryParametrized(ctx context.Context, query string, params arrow.Record) (*QueryIterator, error) {
+	return c.QueryWithOptions(ctx, &DefaultQueryOptions, query, params)
 }
 
 // Query data from InfluxDB IOx with query options.
@@ -93,11 +104,12 @@ func (c *Client) Query(ctx context.Context, query string, params... map[string]i
 //   - ctx: The context.Context to use for the request.
 //   - options: Query options (query type, optional database).
 //   - query: The query string to execute.
+//	 - params: The params to be placed inside query.
 //
 // Returns:
 //   - A custom iterator (*QueryIterator) that can also be used to get raw flightsql reader.
 //   - An error, if any.
-func (c *Client) QueryWithOptions(ctx context.Context, options *QueryOptions, query string, params... map[string]interface{}) (*QueryIterator, error) {
+func (c *Client) QueryWithOptions(ctx context.Context, options *QueryOptions, query string, params arrow.Record) (*QueryIterator, error) {
 	if options == nil {
 		return nil, fmt.Errorf("options not set")
 	}
@@ -133,31 +145,10 @@ func (c *Client) QueryWithOptions(ctx context.Context, options *QueryOptions, qu
 		return nil, fmt.Errorf("flight prepare: %s", err)
 	}
 	defer stmt.Close(ctx)
-	mem := memory.NewCheckedAllocator(memory.DefaultAllocator)
 
-	typeIDs, _, _ := array.FromJSON(mem, arrow.PrimitiveTypes.Int8, strings.NewReader("[0]"))
-	offsets, _, _ := array.FromJSON(mem, arrow.PrimitiveTypes.Int32, strings.NewReader("[0]"))
-	strArray, _, _ := array.FromJSON(mem, arrow.BinaryTypes.String, strings.NewReader(`["%one"]`))
-	bytesArr, _, _ := array.FromJSON(mem, arrow.BinaryTypes.Binary, strings.NewReader("[]"))
-	bigintArr, _, _ := array.FromJSON(mem, arrow.PrimitiveTypes.Int64, strings.NewReader("[]"))
-	dblArr, _, _ := array.FromJSON(mem, arrow.PrimitiveTypes.Float64, strings.NewReader("[]"))
-	paramArr, _ := array.NewDenseUnionFromArraysWithFields(typeIDs,
-		offsets, []arrow.Array{strArray, bytesArr, bigintArr, dblArr},
-		[]string{"string", "bytes", "bigint", "double"})
-	batch := array.NewRecord(arrow.NewSchema([]arrow.Field{
-		{Name: "parameter_1", Type: paramArr.DataType()}}, nil),
-		[]arrow.Array{paramArr}, 1)
-		defer func() {
-			typeIDs.Release()
-			offsets.Release()
-			strArray.Release()
-			bytesArr.Release()
-			bigintArr.Release()
-			dblArr.Release()
-			paramArr.Release()
-			batch.Release()
-		}();
-	stmt.SetParameters(batch);
+	if (params != nil) {
+		stmt.SetParameters(params);
+	}
 	info, err := stmt.Execute(ctx);
 	if err != nil {
 		return nil, fmt.Errorf("flight prepare: %s", err)
